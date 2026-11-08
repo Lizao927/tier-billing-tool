@@ -6,6 +6,7 @@ import sys
 import json
 import traceback
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -13,6 +14,7 @@ try:
     from openpyxl import load_workbook, Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
+    from openpyxl.cell import WriteOnlyCell
 except ImportError:
     raise RuntimeError("缺少 openpyxl 依赖。请运行安装依赖.bat。")
 
@@ -264,50 +266,86 @@ GREEN = "E2F0D9"
 RED = "FCE4D6"
 WHITE = "FFFFFF"
 
+
 def normalize(value):
+    """统一产品类型和黑名单关键词格式，便于做包含匹配。"""
     s = str(value or "").strip().lower()
-    # 忽略空格、全角空格、NBSP及常见分隔符
     return re.sub(r"[\s\u3000\u00a0\-_—（）()\[\]【】,，.。/\\:：]+", "", s)
 
-def is_blacklisted(product_type, keywords):
-    p = normalize(product_type)
-    if not p:
+
+def build_blacklist_matcher(keywords):
+    """
+    将黑名单编译为单个正则表达式。
+    相比每行逐个遍历全部关键词，单次正则扫描可显著减少大账单的匹配开销。
+    """
+    mapping = {}
+    for keyword in keywords:
+        original = str(keyword or "").strip()
+        normalized = normalize(original)
+        if normalized and normalized not in mapping:
+            mapping[normalized] = original
+
+    if not mapping:
+        return None, {}
+
+    # 长关键词优先，避免短关键词抢先命中造成命中原因不够具体。
+    ordered = sorted(mapping, key=len, reverse=True)
+    pattern = re.compile("|".join(re.escape(item) for item in ordered))
+    return pattern, mapping
+
+
+def match_blacklist(product_type, matcher):
+    if matcher is None or product_type is None:
         return None
-    for kw in keywords:
-        k = normalize(kw)
-        if k and k in p:
-            return kw
-    return None
+    normalized_product = normalize(product_type)
+    if not normalized_product:
+        return None
+    pattern, mapping = matcher
+    found = pattern.search(normalized_product)
+    return mapping.get(found.group(0)) if found else None
+
 
 def amount(value):
+    """用 Decimal 解析金额，避免浮点数累计误差。"""
     if value is None or value == "":
-        return 0.0
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value
     if isinstance(value, (int, float)):
-        return float(value)
+        return Decimal(str(value))
     s = str(value).strip()
-    for token in ("¥", "￥", "元", ",", "，"):
+    for token in ("¥", "￥", "元", ",", "，", " "):
         s = s.replace(token, "")
     if not s:
-        return 0.0
+        return Decimal("0")
     try:
-        return float(s)
-    except ValueError:
+        return Decimal(s)
+    except InvalidOperation:
         raise ValueError(f"官网价存在无法识别的金额：{value!r}")
 
-def progressive_fee(monthly, level):
-    remaining = max(float(monthly), 0.0)
-    previous = 0.0
-    fee = 0.0
+
+def money_float(value):
+    return float(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def progressive_fee(consumption, level):
+    """按单月消费额分段累进计算阶梯费用。"""
+    remaining = max(Decimal(str(consumption)), Decimal("0"))
+    previous = Decimal("0")
+    fee = Decimal("0")
     for upper, rate in LEVELS[level]["tiers"]:
+        rate_decimal = Decimal(str(rate))
         if upper is None:
-            portion = max(remaining - previous, 0)
+            portion = max(remaining - previous, Decimal("0"))
         else:
-            portion = max(min(remaining, upper) - previous, 0)
-        fee += portion * rate
-        if upper is None or remaining <= upper:
+            upper_decimal = Decimal(str(upper))
+            portion = max(min(remaining, upper_decimal) - previous, Decimal("0"))
+        fee += portion * rate_decimal
+        if upper is None or remaining <= Decimal(str(upper)):
             break
-        previous = upper
-    return fee
+        previous = Decimal(str(upper))
+    return fee.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
 
 def find_col(headers, names):
     cleaned = [re.sub(r"\s+", "", str(x or "")).lower() for x in headers]
@@ -317,166 +355,184 @@ def find_col(headers, names):
             return cleaned.index(target)
     return None
 
-def read_input(path, sheet_name):
-    keep_vba = path.lower().endswith(".xlsm")
-    wb = load_workbook(path, data_only=True, read_only=True, keep_vba=keep_vba)
-    ws = wb[sheet_name]
-    rows = ws.iter_rows(values_only=True)
+
+def create_report(input_path, sheet_name, level, keywords, output_path):
+    """
+    单月账单高速处理：
+    - 只读模式逐行读取，不把5万+行全部装入内存；
+    - 黑名单一次编译，逐行只做一次正则搜索；
+    - write_only 模式流式写出结果，避免逐单元格创建普通工作簿。
+    """
+    if level not in LEVELS:
+        raise ValueError("产品等级无效，请选择企业级、商业级或尊享级。")
+
+    keep_vba = input_path.lower().endswith(".xlsm")
+    input_wb = load_workbook(
+        input_path, data_only=True, read_only=True, keep_vba=keep_vba
+    )
     try:
-        headers = list(next(rows))
-    except StopIteration:
-        wb.close()
-        raise ValueError("选择的工作表为空。")
-    data = [list(row) for row in rows if any(v is not None and str(v).strip() for v in row)]
-    wb.close()
-    return headers, data
+        if sheet_name not in input_wb.sheetnames:
+            raise ValueError(f"找不到工作表：{sheet_name}")
+        input_ws = input_wb[sheet_name]
+        rows = input_ws.iter_rows(values_only=True)
 
-def create_report(input_path, sheet_name, months, level, keywords, output_path):
-    headers, data = read_input(input_path, sheet_name)
-    type_idx = find_col(headers, ["产品类型"])
-    price_idx = find_col(headers, ["官网价(¥)", "官网价（¥）", "官网价", "官网价(元)", "官网价（元）"])
-    if type_idx is None:
-        raise ValueError("没有找到“产品类型”列，请检查第一行表头。")
-    if price_idx is None:
-        raise ValueError("没有找到“官网价(¥)”列，请检查第一行表头。")
+        try:
+            headers = list(next(rows))
+        except StopIteration:
+            raise ValueError("选择的工作表为空。")
 
-    all_total = filtered_total = eligible_total = 0.0
-    filtered_count = eligible_count = 0
-    output_rows = []
-    for row_num, row in enumerate(data, start=2):
-        row = list(row) + [None] * max(0, len(headers) - len(row))
-        product_type = row[type_idx]
-        price = amount(row[price_idx])
-        all_total += price
-        hit = is_blacklisted(product_type, keywords)
-        if hit:
-            filtered_total += price
-            filtered_count += 1
-            included = 0.0
-            status = "是"
-        else:
-            eligible_total += price
-            eligible_count += 1
-            included = price
-            status = "否"
-        output_rows.append(row[:len(headers)] + [status, hit or "", included])
+        type_idx = find_col(headers, ["产品类型"])
+        price_idx = find_col(
+            headers,
+            ["官网价(¥)", "官网价（¥）", "官网价", "官网价(元)", "官网价（元）"]
+        )
+        if type_idx is None:
+            raise ValueError("没有找到“产品类型”列，请检查第一行表头。")
+        if price_idx is None:
+            raise ValueError("没有找到“官网价(¥)”列，请检查第一行表头。")
 
-    monthly = eligible_total / months
-    tier = progressive_fee(monthly, level)
-    floor = LEVELS[level]["minimum"]
-    monthly_final = max(tier, floor)
-    period_final = monthly_final * months
-    note = "按保底价计费" if tier <= floor else "阶梯计费金额高于保底价，按阶梯计费金额计费"
+        matcher = build_blacklist_matcher(keywords)
+        all_total = Decimal("0")
+        filtered_total = Decimal("0")
+        eligible_total = Decimal("0")
+        filtered_count = 0
+        eligible_count = 0
+        imported_count = 0
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "计费汇总"
-    ws["A1"] = "多等级阶梯计费结果"
-    ws["A1"].font = Font(name="微软雅黑", size=16, bold=True, color=WHITE)
-    ws["A1"].fill = PatternFill("solid", fgColor=NAVY)
-    ws.merge_cells("A1:C1")
+        # write_only 工作簿：结果逐行写入，显著降低大文件写出时的内存和耗时。
+        out_wb = Workbook(write_only=True)
+        summary_ws = out_wb.create_sheet("计费汇总")
+        detail_ws = out_wb.create_sheet("消费明细")
+        rules_ws = out_wb.create_sheet("计费规则")
 
-    summary = [
-        ("项目", "计算结果", "说明"),
-        ("产品等级", level, "本次选择的计费等级"),
-        ("账单月份数", months, "账单覆盖月份"),
-        ("导入明细官网价总额", all_total, "包含黑名单产品"),
-        ("黑名单过滤金额", filtered_total, "命中黑名单产品的官网价"),
-        ("计入消费官网价总额", eligible_total, "过滤后累计官网价，按折前价"),
-        ("月均云服务消费", monthly, f"计入消费官网价总额 ÷ {months}"),
-        ("月均阶梯计费金额", tier, "按所选等级分段累进计算"),
-        ("对应等级月保底价", floor, "所选产品等级的月度保底价"),
-        ("最终月度应收", monthly_final, "月均阶梯费与月保底价取高者"),
-        ("本账期最终应收总额", period_final, "最终月度应收 × 账单月份数"),
-        ("超出保底价金额（月度）", max(tier-floor, 0), "阶梯计费金额超过月保底价的差额"),
-        ("计费备注", note, "自动判断"),
-        ("过滤明细行数", filtered_count, "命中黑名单的明细行数"),
-        ("有效明细行数", eligible_count, "未命中黑名单的明细行数"),
-    ]
-    for r, row in enumerate(summary, start=3):
-        for c, val in enumerate(row, start=1):
-            cell = ws.cell(r, c, val)
-            cell.alignment = Alignment(vertical="center", wrap_text=True)
-            if r == 3:
-                cell.font = Font(bold=True, color=WHITE)
-                cell.fill = PatternFill("solid", fgColor=NAVY)
+        detail_headers = headers + ["是否过滤", "过滤命中项", "计入消费官网价(¥)"]
+        header_cells = []
+        for value in detail_headers:
+            cell = WriteOnlyCell(detail_ws, value=value)
+            cell.font = Font(bold=True, color=WHITE, name="微软雅黑", size=9)
+            cell.fill = PatternFill("solid", fgColor=NAVY)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            header_cells.append(cell)
+        detail_ws.append(header_cells)
+        detail_ws.freeze_panes = "A2"
+
+        # 核心：单次遍历源数据，不缓存全部明细行。
+        for row in rows:
+            if not row or not any(v is not None and str(v).strip() for v in row):
+                continue
+            imported_count += 1
+            row_values = list(row[:len(headers)])
+            if len(row_values) < len(headers):
+                row_values.extend([None] * (len(headers) - len(row_values)))
+
+            price = amount(row_values[price_idx])
+            all_total += price
+
+            product_type = row_values[type_idx]
+            hit = match_blacklist(product_type, matcher)
+            if hit:
+                filtered_total += price
+                filtered_count += 1
+                included = Decimal("0")
+                status = "是"
             else:
-                cell.font = Font(name="微软雅黑", size=10, bold=(c == 1))
-                if c == 1:
-                    cell.fill = PatternFill("solid", fgColor=BLUE)
-                if r in (10, 13):
-                    cell.fill = PatternFill("solid", fgColor=GREEN)
-        ws.row_dimensions[r].height = 28
-    for r in range(6, 16):
-        ws.cell(r, 2).number_format = '#,##0.00'
-    ws["B5"].number_format = "0"
-    ws["B17"].number_format = "0"
-    ws["B18"].number_format = "0"
-    ws.column_dimensions["A"].width = 30
-    ws.column_dimensions["B"].width = 25
-    ws.column_dimensions["C"].width = 66
-    ws.freeze_panes = "A4"
+                eligible_total += price
+                eligible_count += 1
+                included = price
+                status = "否"
 
-    detail = wb.create_sheet("消费明细")
-    out_headers = headers + ["是否过滤", "过滤命中项", "计入消费官网价(¥)"]
-    for c, h in enumerate(out_headers, 1):
-        cell = detail.cell(1, c, h)
-        cell.font = Font(bold=True, color=WHITE, name="微软雅黑", size=9)
-        cell.fill = PatternFill("solid", fgColor=NAVY)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    detail.row_dimensions[1].height = 32
-    for r, row in enumerate(output_rows, 2):
-        for c, val in enumerate(row, 1):
-            cell = detail.cell(r, c, val)
-            cell.font = Font(name="微软雅黑", size=9)
-            if c == len(headers) + 1:
-                cell.fill = PatternFill("solid", fgColor=RED if val == "是" else GREEN)
-            if c == len(headers) + 3 or c == price_idx + 1:
-                cell.number_format = '#,##0.00'
-    for c, h in enumerate(out_headers, 1):
-        width = min(max(len(str(h)) + 3, 12), 36)
-        detail.column_dimensions[get_column_letter(c)].width = width
-    detail.freeze_panes = "A2"
-    detail.auto_filter.ref = detail.dimensions
+            detail_ws.append(row_values + [status, hit or "", money_float(included)])
 
-    rules = wb.create_sheet("计费规则")
-    tier_descriptions = []
-    previous = 0
-    for upper, rate in LEVELS[level]["tiers"]:
-        if upper is None:
-            tier_descriptions.append(f"超过{previous:,.0f}元部分 × {rate:.0%}")
-        else:
-            tier_descriptions.append(f"{previous:,.0f}至{upper:,.0f}元部分 × {rate:.0%}")
-            previous = upper
-    rule_lines = [
-        ("产品等级", level),
-        ("月保底价", floor),
-        ("月均消费计算", f"过滤后官网价总额 ÷ {months}个月"),
-        ("阶梯计算", "；".join(tier_descriptions)),
-        ("最终月度应收", "MAX(月均阶梯计费金额, 月保底价)"),
-        ("本账期最终应收", "最终月度应收 × 账单月份数"),
-        ("黑名单关键词", "；".join(keywords)),
-    ]
-    rules["A1"] = "本次计算使用的规则"
-    rules["A1"].font = Font(bold=True, color=WHITE, size=14)
-    rules["A1"].fill = PatternFill("solid", fgColor=NAVY)
-    rules.merge_cells("A1:B1")
-    for r, row in enumerate(rule_lines, 3):
-        rules.cell(r, 1, row[0]).font = Font(bold=True, color=NAVY)
-        rules.cell(r, 1).fill = PatternFill("solid", fgColor=BLUE)
-        rules.cell(r, 2, row[1]).alignment = Alignment(wrap_text=True, vertical="top")
-        rules.row_dimensions[r].height = 36
-    rules.column_dimensions["A"].width = 24
-    rules.column_dimensions["B"].width = 110
+        # 当前账单为单月账单：不再除以月份数，也不再乘回月份数。
+        tier = progressive_fee(eligible_total, level)
+        floor = Decimal(str(LEVELS[level]["minimum"]))
+        monthly_final = max(tier, floor)
+        over_floor = max(tier - floor, Decimal("0"))
+        note = "按对应等级月保底价计费" if tier <= floor else "阶梯计费金额高于保底价，按阶梯计费金额计费"
 
-    wb.save(output_path)
+        # 汇总页
+        summary_rows = [
+            ("项目", "计算结果", "说明"),
+            ("产品等级", level, "本次选择的计费等级"),
+            ("导入明细官网价总额", money_float(all_total), "包含黑名单产品"),
+            ("黑名单过滤金额", money_float(filtered_total), "命中黑名单产品的官网价，不计入消费"),
+            ("计入消费官网价总额", money_float(eligible_total), "过滤后累计官网价，按折前价计算"),
+            ("阶梯计费金额", money_float(tier), "直接使用单月计入消费官网价总额分段累进计算"),
+            ("对应等级月保底价", money_float(floor), "企业级55,000；商业级28,000；尊享级300,000"),
+            ("最终月度应收", money_float(monthly_final), "阶梯计费金额与月保底价取高者"),
+            ("超出保底价金额", money_float(over_floor), "阶梯计费金额超过月保底价的差额"),
+            ("计费备注", note, "自动判断"),
+            ("导入明细行数", imported_count, "已读取的非空账单行数"),
+            ("过滤明细行数", filtered_count, "命中黑名单的行数"),
+            ("有效明细行数", eligible_count, "未命中黑名单的行数"),
+        ]
+        for idx, row in enumerate(summary_rows):
+            cells = []
+            for value in row:
+                cell = WriteOnlyCell(summary_ws, value=value)
+                cell.alignment = Alignment(vertical="center", wrap_text=True)
+                if idx == 0:
+                    cell.font = Font(bold=True, color=WHITE)
+                    cell.fill = PatternFill("solid", fgColor=NAVY)
+                cells.append(cell)
+            summary_ws.append(cells)
+        summary_ws.freeze_panes = "A2"
+
+        # 规则说明页
+        tier_descriptions = []
+        previous = 0
+        for upper, rate in LEVELS[level]["tiers"]:
+            if upper is None:
+                tier_descriptions.append(f"超过{previous:,.0f}元部分 × {rate:.0%}")
+            else:
+                tier_descriptions.append(f"{previous:,.0f}至{upper:,.0f}元部分 × {rate:.0%}")
+                previous = upper
+        rule_rows = [
+            ("项目", "本次计算口径"),
+            ("产品等级", level),
+            ("计费周期", "单月账单"),
+            ("消费基数", "过滤黑名单后的官网价(¥)总额，折前价"),
+            ("阶梯规则", "；".join(tier_descriptions)),
+            ("月保底价", money_float(floor)),
+            ("最终月度应收", "MAX(阶梯计费金额, 月保底价)"),
+            ("黑名单关键词", "；".join(keywords)),
+        ]
+        for idx, row in enumerate(rule_rows):
+            cells = []
+            for value in row:
+                cell = WriteOnlyCell(rules_ws, value=value)
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                if idx == 0:
+                    cell.font = Font(bold=True, color=WHITE)
+                    cell.fill = PatternFill("solid", fgColor=NAVY)
+                cells.append(cell)
+            rules_ws.append(cells)
+
+        # 写出前设置列宽和筛选区域。
+        for col_idx, title in enumerate(detail_headers, 1):
+            detail_ws.column_dimensions[get_column_letter(col_idx)].width = min(
+                max(len(str(title)) + 3, 12), 32
+            )
+        detail_ws.auto_filter.ref = f"A1:{get_column_letter(len(detail_headers))}{imported_count + 1}"
+
+        out_wb.save(output_path)
+    finally:
+        input_wb.close()
+
     return {
-        "all_total": all_total, "filtered_total": filtered_total,
-        "eligible_total": eligible_total, "monthly": monthly,
-        "tier": tier, "floor": floor, "monthly_final": monthly_final,
-        "period_final": period_final, "filtered_count": filtered_count,
-        "eligible_count": eligible_count, "note": note
+        "all_total": money_float(all_total),
+        "filtered_total": money_float(filtered_total),
+        "eligible_total": money_float(eligible_total),
+        "tier": money_float(tier),
+        "floor": money_float(floor),
+        "monthly_final": money_float(monthly_final),
+        "over_floor": money_float(over_floor),
+        "filtered_count": filtered_count,
+        "eligible_count": eligible_count,
+        "imported_count": imported_count,
+        "note": note,
     }
+
 
 class BillingGUI:
     def __init__(self, root):
@@ -524,10 +580,8 @@ class BillingGUI:
         ttk.Label(row, text="产品等级：").pack(side="left")
         self.level_var = tk.StringVar(value="企业级")
         ttk.Combobox(row, textvariable=self.level_var, values=list(LEVELS), state="readonly", width=12).pack(side="left", padx=(0, 22))
-        ttk.Label(row, text="账单月份数：").pack(side="left")
-        self.month_var = tk.StringVar(value="1")
-        ttk.Spinbox(row, from_=1, to=120, textvariable=self.month_var, width=8).pack(side="left", padx=(0, 10))
-        ttk.Label(row, text="例如1—11月账单填写11", foreground="#666").pack(side="left")
+        ttk.Label(row, text="计费周期：单月账单（直接按当月官网价总额计算）",
+                  foreground="#555").pack(side="left", padx=(18, 0))
 
         blbox = ttk.LabelFrame(main, text="三、黑名单维护（可新增、删除、修改）", padding=12)
         blbox.pack(fill="both", expand=True, pady=5)
@@ -633,11 +687,6 @@ class BillingGUI:
     def run(self):
         if not self.input_path:
             messagebox.showwarning("提示", "请先选择客户消费明细 Excel。"); return
-        try:
-            months = int(self.month_var.get())
-            if not 1 <= months <= 120: raise ValueError
-        except ValueError:
-            messagebox.showwarning("月份错误", "月份数必须为1至120的整数。"); return
         level = self.level_var.get()
         if level not in LEVELS:
             messagebox.showwarning("等级错误", "请选择有效产品等级。"); return
@@ -661,16 +710,16 @@ class BillingGUI:
         self.run_btn.config(state="disabled", text="正在计算，请稍候…")
         self.root.update_idletasks()
         try:
-            result = create_report(self.input_path, sheet, months, level, self.keywords, output)
+            result = create_report(self.input_path, sheet, level, self.keywords, output)
             messagebox.showinfo(
                 "计算完成",
                 f"报告已生成：\n{output}\n\n"
-                f"产品等级：{level}\n账单月份：{months}\n"
-                f"过滤后累计消费：¥{result['eligible_total']:,.2f}\n"
-                f"月均云服务消费：¥{result['monthly']:,.2f}\n"
-                f"月均阶梯计费：¥{result['tier']:,.2f}\n"
+                f"产品等级：{level}\n"
+                f"计入消费官网价总额：¥{result['eligible_total']:,.2f}\n"
+                f"阶梯计费金额：¥{result['tier']:,.2f}\n"
+                f"月保底价：¥{result['floor']:,.2f}\n"
                 f"最终月度应收：¥{result['monthly_final']:,.2f}\n"
-                f"本账期应收总额：¥{result['period_final']:,.2f}\n"
+                f"过滤行数：{result['filtered_count']}；有效行数：{result['eligible_count']}\n"
                 f"备注：{result['note']}"
             )
             try: os.startfile(output)
