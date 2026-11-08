@@ -461,11 +461,12 @@ def create_report(input_path, sheet_name, level, keywords, output_path):
         header_fill = PatternFill("solid", fgColor="4472C4")
         label_fill = PatternFill("solid", fgColor="EAF1F8")
         result_fill = PatternFill("solid", fgColor="E2F0D9")
-        final_fill = PatternFill("solid", fgColor="C6E0B4")
+        # 最终应收仅突出“计算结果”单元格，避免整行视觉权重过高。
+        final_fill = PatternFill("solid", fgColor="FFF2CC")
+        final_font = Font(name="微软雅黑", size=12, bold=True, color="7F6000")
         white_bold = Font(name="微软雅黑", bold=True, color="FFFFFF", size=11)
         normal_font = Font(name="微软雅黑", size=10, color="243247")
         label_font = Font(name="微软雅黑", size=10, bold=True, color="17365D")
-        final_font = Font(name="微软雅黑", size=12, bold=True, color="17365D")
         thin_gray = Side(style="thin", color="D9E2F3")
         cell_border = Border(bottom=thin_gray)
 
@@ -508,18 +509,28 @@ def create_report(input_path, sheet_name, level, keywords, output_path):
                 if is_header:
                     cell.font = white_bold
                     cell.fill = header_fill
-                elif is_final:
-                    cell.font = final_font
-                    cell.fill = final_fill
                 else:
-                    cell.font = label_font if col_idx == 1 else normal_font
-                    cell.fill = label_fill if col_idx == 1 else (result_fill if col_idx == 2 else PatternFill(fill_type=None))
+                    # 最终月度应收所在行，其“项目”和“说明”列仍沿用普通行样式；
+                    # 只有“计算结果”列使用黄色高亮。
+                    if col_idx == 1:
+                        cell.font = label_font
+                        cell.fill = label_fill
+                    elif col_idx == 2:
+                        cell.font = final_font if is_final else normal_font
+                        cell.fill = final_fill if is_final else result_fill
+                    else:
+                        cell.font = normal_font
+                        cell.fill = PatternFill(fill_type=None)
+
                 if col_idx == 2 and isinstance(value, (int, float)):
-                    cell.number_format = '¥#,##0.00'
+                    if row[0] in ("过滤明细行数", "有效明细行数"):
+                        cell.number_format = '#,##0" 行"'
+                    else:
+                        cell.number_format = '¥#,##0.00'
                 cells.append(cell)
             summary_ws.append(cells)
             actual_row = idx + 3
-            summary_ws.row_dimensions[actual_row].height = 31 if is_final else 25
+            summary_ws.row_dimensions[actual_row].height = 27 if is_final else 25
         summary_ws.freeze_panes = "A4"
 
         # 规则说明页
