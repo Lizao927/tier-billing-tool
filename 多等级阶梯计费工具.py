@@ -450,33 +450,77 @@ def create_report(input_path, sheet_name, level, keywords, output_path):
         over_floor = max(tier - floor, Decimal("0"))
         note = "按对应等级月保底价计费" if tier <= floor else "阶梯计费金额高于保底价，按阶梯计费金额计费"
 
-        # 汇总页
+        # 汇总页：简洁版式，突出最终月度应收。
+        summary_ws.sheet_properties.tabColor = "4472C4"
+        summary_ws.sheet_view.showGridLines = False
+        summary_ws.column_dimensions["A"].width = 27
+        summary_ws.column_dimensions["B"].width = 21
+        summary_ws.column_dimensions["C"].width = 48
+
+        title_fill = PatternFill("solid", fgColor="17365D")
+        header_fill = PatternFill("solid", fgColor="4472C4")
+        label_fill = PatternFill("solid", fgColor="EAF1F8")
+        result_fill = PatternFill("solid", fgColor="E2F0D9")
+        final_fill = PatternFill("solid", fgColor="C6E0B4")
+        white_bold = Font(name="微软雅黑", bold=True, color="FFFFFF", size=11)
+        normal_font = Font(name="微软雅黑", size=10, color="243247")
+        label_font = Font(name="微软雅黑", size=10, bold=True, color="17365D")
+        final_font = Font(name="微软雅黑", size=12, bold=True, color="17365D")
+        thin_gray = Side(style="thin", color="D9E2F3")
+        cell_border = Border(bottom=thin_gray)
+
+        # 标题行
+        title_cells = []
+        for value in ("阶梯计费汇总", "", ""):
+            cell = WriteOnlyCell(summary_ws, value=value)
+            cell.font = Font(name="微软雅黑", size=15, bold=True, color="FFFFFF")
+            cell.fill = title_fill
+            cell.alignment = Alignment(vertical="center")
+            title_cells.append(cell)
+        summary_ws.append(title_cells)
+        summary_ws.row_dimensions[1].height = 32
+        summary_ws.append([])
+
+        # 删除不需要展示的过程字段，只保留关键计费结果。
         summary_rows = [
             ("项目", "计算结果", "说明"),
             ("产品等级", level, "本次选择的计费等级"),
-            ("导入明细官网价总额", money_float(all_total), "包含黑名单产品"),
-            ("黑名单过滤金额", money_float(filtered_total), "命中黑名单产品的官网价，不计入消费"),
-            ("计入消费官网价总额", money_float(eligible_total), "过滤后累计官网价，按折前价计算"),
-            ("阶梯计费金额", money_float(tier), "直接使用单月计入消费官网价总额分段累进计算"),
-            ("对应等级月保底价", money_float(floor), "企业级55,000；商业级28,000；尊享级300,000"),
+            ("当月云服务消费总额", money_float(eligible_total), "过滤黑名单后的官网价总额，按折前价计算"),
+            ("阶梯计费金额", money_float(tier), "按所选等级对当月云服务消费总额分段累进计算"),
             ("最终月度应收", money_float(monthly_final), "阶梯计费金额与月保底价取高者"),
             ("超出保底价金额", money_float(over_floor), "阶梯计费金额超过月保底价的差额"),
             ("计费备注", note, "自动判断"),
-            ("导入明细行数", imported_count, "已读取的非空账单行数"),
             ("过滤明细行数", filtered_count, "命中黑名单的行数"),
             ("有效明细行数", eligible_count, "未命中黑名单的行数"),
         ]
         for idx, row in enumerate(summary_rows):
             cells = []
-            for value in row:
+            is_header = idx == 0
+            is_final = row[0] == "最终月度应收"
+            for col_idx, value in enumerate(row, start=1):
                 cell = WriteOnlyCell(summary_ws, value=value)
-                cell.alignment = Alignment(vertical="center", wrap_text=True)
-                if idx == 0:
-                    cell.font = Font(bold=True, color=WHITE)
-                    cell.fill = PatternFill("solid", fgColor=NAVY)
+                cell.alignment = Alignment(
+                    vertical="center",
+                    horizontal="right" if col_idx == 2 and isinstance(value, (int, float)) else "left",
+                    wrap_text=True
+                )
+                cell.border = cell_border
+                if is_header:
+                    cell.font = white_bold
+                    cell.fill = header_fill
+                elif is_final:
+                    cell.font = final_font
+                    cell.fill = final_fill
+                else:
+                    cell.font = label_font if col_idx == 1 else normal_font
+                    cell.fill = label_fill if col_idx == 1 else (result_fill if col_idx == 2 else PatternFill(fill_type=None))
+                if col_idx == 2 and isinstance(value, (int, float)):
+                    cell.number_format = '¥#,##0.00'
                 cells.append(cell)
             summary_ws.append(cells)
-        summary_ws.freeze_panes = "A2"
+            actual_row = idx + 3
+            summary_ws.row_dimensions[actual_row].height = 31 if is_final else 25
+        summary_ws.freeze_panes = "A4"
 
         # 规则说明页
         tier_descriptions = []
@@ -713,14 +757,9 @@ class BillingGUI:
             result = create_report(self.input_path, sheet, level, self.keywords, output)
             messagebox.showinfo(
                 "计算完成",
-                f"报告已生成：\n{output}\n\n"
-                f"产品等级：{level}\n"
-                f"计入消费官网价总额：¥{result['eligible_total']:,.2f}\n"
-                f"阶梯计费金额：¥{result['tier']:,.2f}\n"
-                f"月保底价：¥{result['floor']:,.2f}\n"
-                f"最终月度应收：¥{result['monthly_final']:,.2f}\n"
-                f"过滤行数：{result['filtered_count']}；有效行数：{result['eligible_count']}\n"
-                f"备注：{result['note']}"
+                f"产品等级：{level}\\n"
+                f"最终月度应收：¥{result['monthly_final']:,.2f}\\n"
+                f"计费备注：{result['note']}"
             )
             try: os.startfile(output)
             except Exception: pass
