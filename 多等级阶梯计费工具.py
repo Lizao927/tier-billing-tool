@@ -757,8 +757,8 @@ class BillingGUI:
             result = create_report(self.input_path, sheet, level, self.keywords, output)
             messagebox.showinfo(
                 "计算完成",
-                f"产品等级：{level}\\n"
-                f"最终月度应收：¥{result['monthly_final']:,.2f}\\n"
+                f"产品等级：{level}\n"
+                f"最终月度应收：¥{result['monthly_final']:,.2f}\n"
                 f"计费备注：{result['note']}"
             )
             try: os.startfile(output)
